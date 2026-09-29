@@ -52,19 +52,22 @@ def _patch_httpx(handler: Callable[[httpx.Request], httpx.Response]) -> Any:
     return patch("httpx.AsyncClient", factory)
 
 
-def _answer(choice: str, confidence: object = 0.9) -> httpx.Response:
-    body = {
-        "model": "jev-1",
-        "answers": {
-            "route": {
-                "type": "choice",
-                "choice": choice,
-                "confidence": confidence,
-                "probabilities": {choice: 0.9, "codex / gpt-max": 0.1},
-            }
-        },
-    }
-    return httpx.Response(200, json=body)
+_OPTIONS = ["codex / gpt-mini", "codex / gpt-max", "claude-native / haiku", "claude-native / opus"]
+_DROP = object()
+
+
+def _answer(choice: object, confidence: object = 0.9, **fields: object) -> httpx.Response:
+    """A 200 answering the route question; *fields* add or (with ``_DROP``) remove keys."""
+    route: dict[str, object] = {"type": "choice", "choice": choice, "confidence": confidence}
+    route.update(fields)
+    route = {k: v for k, v in route.items() if v is not _DROP}
+    return httpx.Response(200, json={"model": "jev-1", "answers": {"route": route}})
+
+
+def _distribution(choice: str, p: float) -> dict[str, float]:
+    """*p* on *choice*, the rest shared evenly by the other candidates."""
+    rest = (1.0 - p) / (len(_OPTIONS) - 1)
+    return {label: (p if label == choice else rest) for label in _OPTIONS}
 
 
 def _client(judge: Any = None, **kwargs: Any) -> DecisionModelRoutingClient:
@@ -119,6 +122,57 @@ def _raise_connect(request: httpx.Request) -> httpx.Response:
         (lambda r: _answer("codex / gpt-mini", confidence="high"), "below"),
         (lambda r: _answer("codex / gpt-mini", confidence=None), "below"),
         (lambda r: _answer("gemini / flash"), "unknown option"),
+        (lambda r: _answer(["codex / gpt-mini"]), "unknown option"),
+        (lambda r: _answer("codex / gpt-mini", type="score"), "not a choice"),
+        # `answer_confidence`, when sent, decides over a confident `confidence`.
+        (lambda r: _answer("codex / gpt-mini", answer_confidence=0.3), "below"),
+        (lambda r: _answer("codex / gpt-mini", answer_confidence="high"), "below"),
+        # Jev's shape: `confidence` decides, even when the pick's probability is higher.
+        (
+            lambda r: _answer(
+                "codex / gpt-mini",
+                confidence=0.45,
+                probabilities=_distribution("codex / gpt-mini", 0.8),
+            ),
+            "below",
+        ),
+        (
+            lambda r: _answer(
+                "codex / gpt-mini",
+                confidence=_DROP,
+                probabilities=_distribution("codex / gpt-mini", 0.4),
+            ),
+            "below",
+        ),
+        (lambda r: _answer("codex / gpt-mini", probabilities=[0.9, 0.1]), "not an object"),
+        (
+            lambda r: _answer("codex / gpt-mini", probabilities={"codex / gpt-mini": 1.0}),
+            "cover exactly",
+        ),
+        (
+            lambda r: _answer(
+                "codex / gpt-mini",
+                probabilities={**_distribution("codex / gpt-mini", 0.9), "gemini / flash": 0.0},
+            ),
+            "cover exactly",
+        ),
+        (
+            lambda r: _answer(
+                "codex / gpt-mini",
+                probabilities={**_distribution("codex / gpt-mini", 0.9), "codex / gpt-max": "x"},
+            ),
+            "not a number",
+        ),
+        (
+            lambda r: _answer("codex / gpt-mini", probabilities=dict.fromkeys(_OPTIONS, 0.5)),
+            "sum to",
+        ),
+        (
+            lambda r: _answer(
+                "codex / gpt-mini", probabilities=_distribution("codex / gpt-max", 0.9)
+            ),
+            "not the most probable",
+        ),
         (lambda r: httpx.Response(200, json={"answers": {}}), "malformed"),
         (lambda r: httpx.Response(200, text="not json"), "malformed"),
         (lambda r: httpx.Response(503, text="overloaded"), "HTTP 503"),
@@ -129,6 +183,18 @@ def _raise_connect(request: httpx.Request) -> httpx.Response:
         "non-numeric-confidence",
         "missing-confidence",
         "unknown-option",
+        "non-string-choice",
+        "not-a-choice",
+        "low-answer-confidence",
+        "non-numeric-answer-confidence",
+        "confidence-decides-over-pick-probability",
+        "low-pick-probability-without-confidence",
+        "probabilities-not-an-object",
+        "probabilities-missing-candidates",
+        "probabilities-extra-option",
+        "probabilities-non-numeric",
+        "probabilities-do-not-sum-to-one",
+        "choice-disagrees-with-probabilities",
         "missing-answer",
         "non-json",
         "error-status",
@@ -150,6 +216,52 @@ async def test_every_non_answer_defers_to_the_judge(handler: Any, reason: str) -
     with _patch_httpx(handler):
         assert await alone.route("task", _MODELS) is None
     assert reason in (alone.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_a_laya_style_answer_is_gated_on_the_pick_probability_not_the_entropy() -> None:
+    # Laya puts normalized entropy in `confidence` (low over four options even when one
+    # clearly wins) and the calibrated probability of the answer in `answer_confidence`.
+    laya = _answer(
+        "claude-native / haiku",
+        confidence=0.21,
+        answer_confidence=0.7,
+        probabilities=_distribution("claude-native / haiku", 0.7),
+    )
+    judge = _Judge()
+    with _patch_httpx(lambda r: laya):
+        result = await _client(judge).route("task", _MODELS)
+    assert result is not None
+    assert (result.harness, result.model, judge.calls) == ("claude-native", "haiku", 0)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"type": _DROP},
+        # Jev as sampled live: two-decimal probabilities, `confidence` below the pick's.
+        {
+            "confidence": 0.74,
+            "probabilities": {
+                "codex / gpt-mini": 0.8,
+                "claude-native / haiku": 0.2,
+                "codex / gpt-max": 0.0,
+                "claude-native / opus": 0.0,
+            },
+        },
+        {"probabilities": {**_distribution("codex / gpt-mini", 0.7), "codex / gpt-max": 0.0999}},
+        # With neither confidence field, the pick's own probability decides.
+        {"confidence": _DROP, "probabilities": _distribution("codex / gpt-mini", 0.7)},
+    ],
+    ids=["no-type-field", "jev-live-shape", "rounded-distribution", "pick-probability-only"],
+)
+@pytest.mark.asyncio
+async def test_a_sound_answer_still_routes(fields: dict[str, object]) -> None:
+    judge = _Judge()
+    with _patch_httpx(lambda r: _answer("codex / gpt-mini", **fields)):
+        result = await _client(judge).route("task", _MODELS)
+    assert result is not None
+    assert (result.model, judge.calls) == ("gpt-mini", 0)
 
 
 @pytest.mark.asyncio

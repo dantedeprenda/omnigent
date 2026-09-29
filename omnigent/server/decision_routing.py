@@ -27,6 +27,8 @@ DEFAULT_REQUEST_TIMEOUT_S = 3.0
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5
 #: The same message budget the judge gets.
 MAX_MESSAGE_CHARS = 4000
+#: How far a returned distribution may sum from 1; servers round each probability.
+PROBABILITY_SUM_TOLERANCE = 0.01
 
 _QUESTION_ID = "route"
 _INSTRUCTIONS = (
@@ -39,10 +41,10 @@ _INSTRUCTIONS = (
 class DecisionModelRoutingClient:
     """Route with one ``/v1/systemone`` Choice question; defer to *fallback* when unsure.
 
-    The call fails open: a transport error, an error status, a malformed answer, a pick
-    outside the candidates, or a confidence below the threshold all hand the call to
-    *fallback*. With no fallback the call returns ``None`` (not routed) and
-    :attr:`last_error` says why.
+    The call fails open: a transport error, an error status, a malformed answer, an answer
+    that is not a choice, a pick outside the candidates, a returned distribution that does
+    not back the pick, or a confidence below the threshold all hand the call to *fallback*.
+    With no fallback the call returns ``None`` (not routed) and :attr:`last_error` says why.
     """
 
     #: Source stamped on decisions this client answers itself.
@@ -138,22 +140,31 @@ class DecisionModelRoutingClient:
             )
             return None, f"decision model returned HTTP {resp.status_code}"
         try:
-            answer = resp.json()["answers"][_QUESTION_ID]
+            payload = resp.json()
+            answer = payload["answers"][_QUESTION_ID]
             pick = answer["choice"]
         except (ValueError, KeyError, TypeError):
             return None, "decision model returned a malformed answer"
-        if pick not in options:
+        if answer.get("type", "choice") != "choice":
+            return None, f"decision model answered a {answer.get('type')!r} question, not a choice"
+        if not isinstance(pick, str) or pick not in options:
             return None, f"decision model picked an unknown option {pick!r}"
-        confidence = _unit_float(answer.get("confidence"))
+        probabilities = answer.get("probabilities")
+        if probabilities is not None:
+            problem = _distribution_problem(probabilities, pick, options)
+            if problem:
+                return None, f"decision model returned an inconsistent answer: {problem}"
+        confidence = _pick_confidence(answer, pick)
         if confidence is None or confidence < self._threshold:
             return None, f"decision model confidence {confidence} is below {self._threshold}"
         harness, model, _ = options[pick]
         _logger.info(
-            "DecisionModelRoutingClient: picked %s/%s confidence=%.2f top=%s",
+            "DecisionModelRoutingClient: picked %s/%s confidence=%.2f top=%s resolved_model=%s",
             harness,
             model,
             confidence,
-            _top(answer.get("probabilities")),
+            _top(probabilities),
+            payload.get("model"),
         )
         rationale = (
             f"The decision model picked {model} as the cheapest option that handles "
@@ -192,6 +203,51 @@ def _options(available_models: dict[str, list[str]]) -> dict[str, tuple[str, str
             desc = f"model {i + 1} of {len(models)} in the {harness} harness (1 is the cheapest)"
             options[f"{harness} / {model}"] = (harness, model, desc)
     return options
+
+
+def _pick_confidence(
+    answer: dict[str, Any],  # type: ignore[explicit-any]  # JSON object
+    pick: str,
+) -> float | None:
+    """The confidence in *pick* that the threshold is compared against.
+
+    Servers disagree on what ``confidence`` means. Jev documents it as the confidence in
+    the selected choice, the number to gate on. Laya reports the normalized entropy of the
+    whole distribution there, and the calibrated probability of the answer as
+    ``answer_confidence``. So prefer ``answer_confidence``, then ``confidence``, and only
+    without either the pick's own probability.
+    """
+    if "answer_confidence" in answer:
+        return _unit_float(answer["answer_confidence"])
+    if "confidence" in answer:
+        return _unit_float(answer["confidence"])
+    probabilities = answer.get("probabilities")
+    return _unit_float(probabilities.get(pick)) if isinstance(probabilities, dict) else None
+
+
+def _distribution_problem(
+    probabilities: Any,  # type: ignore[explicit-any]  # JSON value
+    pick: str,
+    options: dict[str, tuple[str, str, str]],
+) -> str | None:
+    """Why *probabilities* cannot back *pick*, or ``None`` when it is a sound distribution.
+
+    Sound means one probability per candidate and nothing else, each in [0, 1], summing
+    to 1 within :data:`PROBABILITY_SUM_TOLERANCE`, with *pick* the most probable.
+    """
+    if not isinstance(probabilities, dict):
+        return "probabilities is not an object"
+    if set(probabilities) != set(options):
+        return "probabilities do not cover exactly the candidates"
+    values = {k: _unit_float(v) for k, v in probabilities.items()}
+    if any(v is None for v in values.values()):
+        return "a probability is not a number in [0, 1]"
+    total = sum(v for v in values.values() if v is not None)
+    if abs(total - 1.0) > PROBABILITY_SUM_TOLERANCE:
+        return f"probabilities sum to {total:.3f}"
+    if (values[pick] or 0.0) < max(v for v in values.values() if v is not None):
+        return "the choice is not the most probable option"
+    return None
 
 
 def _unit_float(value: Any) -> float | None:  # type: ignore[explicit-any]  # JSON value
